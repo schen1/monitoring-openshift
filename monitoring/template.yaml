@@ -1,0 +1,466 @@
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: prometheus
+  annotations:
+    "openshift.io/display-name": Prometheus
+    description: |
+      A monitoring solution for an OpenShift cluster - collect and gather metrics and alerts from nodes, services, and the infrastructure.
+    iconClass:  icon-codeigniter
+    tags: "monitoring,prometheus, alertmanager,time-series"
+parameters:
+- description: The namespace to instantiate prometheus under. Defaults to 'kube-system'.
+  name: NAMESPACE
+  required: true
+#  value: kube-system
+- description: The location of the proxy image
+  name: IMAGE_PROXY
+  value: openshift/oauth-proxy:v1.0.0
+- description: The location of the prometheus image
+  name: IMAGE_PROMETHEUS
+  value: quay.io/prometheus/prometheus:v2.9.2
+- description: The location of the alertmanager image
+  name: IMAGE_ALERTMANAGER
+  value: quay.io/prometheus/alertmanager:v0.16.2
+- description: The session secret for the proxy
+  name: SESSION_SECRET
+  generate: expression
+  from: "[a-zA-Z0-9]{43}"
+objects:
+# Authorize the prometheus service account to read data about the cluster
+- apiVersion: v1
+  kind: ServiceAccount
+  metadata:
+    name: prometheus
+    namespace: "${NAMESPACE}"
+    annotations:
+      serviceaccounts.openshift.io/oauth-redirectreference.prom: '{"kind":"OAuthRedirectReference","apiVersion":"v1","reference":{"kind":"Route","name":"prometheus"}}'
+      serviceaccounts.openshift.io/oauth-redirectreference.alerts: '{"kind":"OAuthRedirectReference","apiVersion":"v1","reference":{"kind":"Route","name":"alerts"}}'
+- apiVersion: authorization.openshift.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    name: prometheus-cluster-reader
+  roleRef:
+    name: system:auth-delegator 
+  subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: "${NAMESPACE}"
+- apiVersion: authorization.openshift.io/v1
+  kind: RoleBinding
+  metadata:
+    name: prometheus-viewer
+  roleRef:
+    name: view 
+  subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: "${NAMESPACE}"
+# Create a fully end-to-end TLS connection to the prometheus proxy
+- apiVersion: route.openshift.io/v1
+  kind: Route
+  metadata:
+    name: prometheus
+    namespace: "${NAMESPACE}"
+  spec:
+    to:
+      name: prometheus
+    port:
+      targetPort: prometheus-https
+    tls:
+      termination: Reencrypt
+      insecureEdgeTerminationPolicy: Redirect
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/scheme: https
+      service.alpha.openshift.io/serving-cert-secret-name: prometheus-tls
+    labels:
+      name: prometheus
+    name: prometheus
+    namespace: "${NAMESPACE}"
+  spec:
+    ports:
+    - name: prometheus-https
+      port: 443
+      protocol: TCP
+      targetPort: 8443
+    selector:
+      app: prometheus
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    name: prometheus-proxy
+    namespace: "${NAMESPACE}"
+  stringData:
+    session_secret: "${SESSION_SECRET}="
+
+- apiVersion: apps.openshift.io/v1
+  kind: DeploymentConfig
+  metadata:
+    annotations:
+      openshift.io/generated-by: OpenShiftNewApp
+    creationTimestamp: 2019-04-08T13:53:17Z
+    generation: 10
+    labels:
+      app: alertmanager
+    name: alertmanager
+    namespace: "${NAMESPACE}"
+  spec:
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+      app: alertmanager
+      deploymentconfig: alertmanager
+    strategy:
+      activeDeadlineSeconds: 21600
+      recreateParams:
+        timeoutSeconds: 600
+      resources: {}
+      rollingParams:
+        intervalSeconds: 1
+        maxSurge: 25%
+        maxUnavailable: 25%
+        timeoutSeconds: 600
+        updatePeriodSeconds: 1
+      type: Rolling
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app: alertmanager
+          deploymentconfig: alertmanager
+        name: alertmanager
+      spec:
+        containers:
+        - args:
+          - --config.file=/etc/alertmanager/config.yml
+          - --storage.path=/alertmanager
+          image: ${IMAGE_ALERTMANAGER}
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /#/status
+              port: 9093
+              scheme: HTTP
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 1
+          name: alertmanager
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /#/status
+              port: 9093
+              scheme: HTTP
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 1
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+          - mountPath: /etc/alertmanager
+            name: config-volume
+          - mountPath: /alertmanager
+            name: data-volume
+        dnsPolicy: ClusterFirst
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        terminationGracePeriodSeconds: 30
+        volumes:
+        - name: data-volume
+          persistentVolumeClaim:
+            claimName: alertmanager-data-pvc
+        - configMap:
+            defaultMode: 420
+            name: alertmanager
+          name: config-volume
+    test: false
+    triggers:
+    - type: ConfigChange
+- apiVersion: apps.openshift.io/v1
+  kind: DeploymentConfig
+  metadata:
+    generation: 7
+    labels:
+      app: prometheus
+    name: prometheus
+    namespace: "${NAMESPACE}"
+  spec:
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+      app: prometheus
+      deploymentconfig: prometheus
+    strategy:
+      activeDeadlineSeconds: 21600
+      recreateParams:
+        timeoutSeconds: 600
+      resources: {}
+      rollingParams:
+        intervalSeconds: 1
+        maxSurge: 25%
+        maxUnavailable: 25%
+        timeoutSeconds: 600
+        updatePeriodSeconds: 1
+      type: Rolling
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app: prometheus
+          deploymentconfig: prometheus
+        name: prometheus
+      spec:
+        containers:
+        - args:
+          - -provider=openshift
+          - -https-address=:8443
+          - -http-address=
+          - -email-domain=*
+          - -upstream=http://localhost:9090
+          - -client-id=system:serviceaccount:prometheus:prometheus
+          - -openshift-ca=/etc/pki/tls/cert.pem
+          - -openshift-ca=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          - '-openshift-sar={"resource": "namespaces", "verb": "get", "resourceName":
+            "prometheus", "namespace": "prometheus"}'
+          - -tls-cert=/etc/tls/private/tls.crt
+          - -tls-key=/etc/tls/private/tls.key
+          - -client-secret-file=/var/run/secrets/kubernetes.io/serviceaccount/token
+          - -cookie-secret-file=/etc/proxy/secrets/session_secret
+          - -skip-auth-regex=^/metrics
+          image: openshift/oauth-proxy:v1.0.0
+          imagePullPolicy: IfNotPresent
+          name: prom-proxy
+          ports:
+          - containerPort: 8443
+            name: web
+            protocol: TCP
+          resources:
+            limits:
+              cpu: 100m
+              memory: 200Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+          - mountPath: /etc/tls/private
+            name: prometheus-tls
+          - mountPath: /etc/proxy/secrets
+            name: prometheus-secrets
+        - args:
+          - --storage.tsdb.retention=6h
+          - --storage.tsdb.min-block-duration=2m
+          - --config.file=/etc/prometheus/prometheus.yml
+          - --web.enable-lifecycle
+          image: ${IMAGE_PROMETHEUS}
+          imagePullPolicy: IfNotPresent
+          name: prometheus
+          ports:
+          - containerPort: 9090
+            name: prometheus
+            protocol: TCP
+          resources:
+            limits:
+              cpu: 400m
+              memory: 1Gi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+          - mountPath: /etc/prometheus
+            name: prometheus-config
+          - mountPath: /prometheus
+            name: prometheus-data
+        dnsPolicy: ClusterFirst
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: prometheus
+        serviceAccountName: prometheus
+        terminationGracePeriodSeconds: 30
+        volumes:
+        - name: prometheus-secrets
+          secret:
+            secretName: prometheus-proxy
+        - name: prometheus-tls
+          secret:
+            secretName: prometheus-tls
+        - configMap:
+            defaultMode: 420
+            name: prometheus
+          name: prometheus-config
+        - name: prometheus-data
+          persistentVolumeClaim:
+            claimName: prometheus-data-pvc
+    test: false
+    triggers:
+    - type: ConfigChange
+
+- apiVersion: v1
+  data:
+    config.yml: |-
+      global:
+
+      # The root route on which each incoming alert enters.
+      route:
+        # The root route must not have any matchers as it is the entry point for
+        # all alerts. It needs to have a receiver configured so alerts that do not
+        # match any of the sub-routes are sent to someone.
+        receiver: 'webhook'
+
+        # The labels by which incoming alerts are grouped together. For example,
+        # multiple alerts coming in for cluster=A and alertname=LatencyHigh would
+        # be batched into a single group.
+        group_by: ['alertname', 'cluster']
+
+        # When a new group of alerts is created by an incoming alert, wait at
+        # least 'group_wait' to send the initial notification.
+        # This way ensures that you get multiple alerts for the same group that start
+        # firing shortly after another are batched together on the first
+        # notification.
+        group_wait: 30s
+
+        # When the first notification was sent, wait 'group_interval' to send a batch
+        # of new alerts that started firing for that group.
+        group_interval: 5m
+
+        # If an alert has successfully been sent, wait 'repeat_interval' to
+        # resend them.
+        repeat_interval: 3h
+
+      receivers:
+      - name: 'webhook'
+        webhook_configs:
+        - url: https://webhook.site/5b475278-bd51-4c3d-b1d9-33b2914e3a5c
+  kind: ConfigMap
+  metadata:
+    name: alertmanager
+    namespace: ${NAMESPACE}
+- apiVersion: v1
+  data:
+    prometheus.rules: |+
+      groups:
+      - name: example-rules
+        interval: 30s # defaults to global interval
+        rules:
+        - alert: Node Down
+          expr: up{job="kubernetes-nodes"} == 0
+          annotations:
+            miqTarget: "ContainerNode"
+            severity: "HIGH"
+            message: "{{$labels.instance}} is down"
+        - alert: ReplicaCount
+          expr: count(up{app="java-app"}) < 3
+          annotations:
+            miqTarget: "ReplicaCount"
+            severity: "CRITICAL"
+            message: "{{$labels.instance}} has less than 3 replicas"
+
+    prometheus.yml: "rule_files:\n  - 'prometheus.rules'\n\n# A scrape configuration
+      for running Prometheus on a Kubernetes cluster.\n# This uses separate scrape
+      configs for cluster components (i.e. API server, node)\n# and services to allow
+      each to use different authentication configs.\n#\n# Kubernetes labels will be
+      added as Prometheus labels on metrics via the\n# `labelmap` relabeling action.\n\n#
+      Scrape config for API servers.\n#\n# Kubernetes exposes API servers as endpoints
+      to the default/kubernetes\n# service so this uses `endpoints` role and uses
+      relabelling to only keep\n# the endpoints associated with the default/kubernetes
+      service using the\n# default named port `https`. This works for single API server
+      deployments as\n# well as HA API server deployments.\nscrape_configs:\n- job_name:
+      'kubernetes-pods'\n\n  kubernetes_sd_configs:\n  - role: pod\n    namespaces:\n
+      \     names:\n      - prometheus\n      - java-test\n\n  relabel_configs:\n
+      \ - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]\n
+      \   action: keep\n    regex: true\n  - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]\n
+      \   action: replace\n    target_label: __metrics_path__\n    regex: (.+)\n  -
+      source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]\n
+      \   action: replace\n    regex: ([^:]+)(?::\\d+)?;(\\d+)\n    replacement: $1:$2\n
+      \   target_label: __address__\n  - action: labelmap\n    regex: __meta_kubernetes_pod_label_(.+)\n
+      \ - source_labels: [__meta_kubernetes_namespace]\n    action: replace\n    target_label:
+      kubernetes_namespace\n  - source_labels: [__meta_kubernetes_pod_name]\n    action:
+      replace\n    target_label: kubernetes_pod_name\n\n# Scrape config for service
+      endpoints.\n#\n# The relabeling allows the actual service scrape endpoint to
+      be configured\n# via the following annotations:\n#\n# * `prometheus.io/scrape`:
+      Only scrape services that have a value of `true`\n# * `prometheus.io/scheme`:
+      If the metrics endpoint is secured then you will need\n# to set this to `https`
+      & most likely set the `tls_config` of the scrape config.\n# * `prometheus.io/path`:
+      If the metrics path is not `/metrics` override this.\n# * `prometheus.io/port`:
+      If the metrics are exposed on a different port to the\n# service then set this
+      appropriately.\n- job_name: 'kubernetes-service-endpoints'\n\n  tls_config:\n
+      \   ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt\n    # TODO:
+      this should be per target\n    insecure_skip_verify: true\n\n  kubernetes_sd_configs:\n
+      \ - role: endpoints\n    namespaces:\n      names:\n      - prometheus\n\n  relabel_configs:\n
+      \ - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]\n
+      \   action: keep\n    regex: true\n  - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scheme]\n
+      \   action: replace\n    target_label: __scheme__\n    regex: (https?)\n  -
+      source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]\n    action:
+      replace\n    target_label: __metrics_path__\n    regex: (.+)\n  - source_labels:
+      [__address__, __meta_kubernetes_service_annotation_prometheus_io_port]\n    action:
+      replace\n    target_label: __address__\n    regex: (.+)(?::\\d+);(\\d+)\n    replacement:
+      $1:$2\n  - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_username]\n
+      \   action: replace\n    target_label: __basic_auth_username__\n    regex: (.+)\n
+      \ - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_password]\n
+      \   action: replace\n    target_label: __basic_auth_password__\n    regex: (.+)\n
+      \ - action: labelmap\n    regex: __meta_kubernetes_service_label_(.+)\n  - source_labels:
+      [__meta_kubernetes_namespace]\n    action: replace\n    target_label: kubernetes_namespace\n
+      \ - source_labels: [__meta_kubernetes_service_name]\n    action: replace\n    target_label:
+      kubernetes_name\n\n# Example scrape config for probing services via the Blackbox
+      Exporter.\n#\n# The relabeling allows the actual service scrape endpoint to
+      be configured\n# via the following annotations:\n#\n# * `prometheus.io/probe`:
+      Only probe services that have a value of `true`\n- job_name: 'kubernetes-services'\n\n
+      \ tls_config:\n    ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt\n
+      \   # TODO: this should be per target\n    insecure_skip_verify: true\n\n  metrics_path:
+      /metrics\n  params:\n    module: [http_2xx]\n\n  kubernetes_sd_configs:\n  -
+      role: service\n    namespaces:\n      names:\n      - prometheus\n\n  relabel_configs:\n
+      \ - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_probe]\n
+      \   action: keep\n    regex: true\n  - source_labels: [__address__]\n    target_label:
+      __param_target\n  - target_label: __address__\n    replacement: blackbox-exporter.example.com:9115\n
+      \ - source_labels: [__param_target]\n    target_label: instance\n  - action:
+      labelmap\n    regex: __meta_kubernetes_service_label_(.+)\n  - source_labels:
+      [__meta_kubernetes_namespace]\n    target_label: kubernetes_namespace\n  - source_labels:
+      [__meta_kubernetes_service_name]\n    target_label: kubernetes_name\n    \nalerting:\n
+      \ alertmanagers:\n  - scheme: http\n    static_configs:\n    - targets:\n      -
+      \"alertmanager.prometheus.svc:9093\"\n"
+  kind: ConfigMap
+  metadata:
+    name: prometheus
+    namespace: ${NAMESPACE}
+
+# Create a fully end-to-end TLS connection to the alert proxy
+- apiVersion: route.openshift.io/v1
+  kind: Route
+  metadata:
+    name: alertmanager
+    namespace: "${NAMESPACE}"
+  spec:
+    to:
+      name: alertmanager
+    tls:
+      termination: Edge
+
+- apiVersion: v1
+  kind: Service
+  metadata:
+    labels:
+      name: alertmanager
+    name: alertmanager
+    namespace: "${NAMESPACE}"
+  spec:
+    ports:
+    - name: alertmanager
+      port: 9093
+      protocol: TCP
+      targetPort: 9093
+    selector:
+      app: alertmanager
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    name: alerts-proxy
+    namespace: "${NAMESPACE}"
+  stringData:
+    session_secret: "${SESSION_SECRET}="
