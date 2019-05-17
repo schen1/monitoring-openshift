@@ -22,6 +22,9 @@ parameters:
 - description: The location of the alertmanager image
   name: IMAGE_ALERTMANAGER
   value: quay.io/prometheus/alertmanager:v0.16.2
+- description: The location of the blackbox exporter image
+  name: IMAGE_BLACKBOX_EXPORTER
+  value: quay.io/prometheus/blackbox-exporter:v0.14.0
 - description: The session secret for the proxy
   name: SESSION_SECRET
   generate: expression
@@ -87,6 +90,10 @@ objects:
       port: 443
       protocol: TCP
       targetPort: 8443
+    - name: prometheus-direct
+      port: 9090
+      protocol: TCP
+      targetPort: 9090
     selector:
       app: prometheus
 - apiVersion: v1
@@ -100,10 +107,95 @@ objects:
 - apiVersion: apps.openshift.io/v1
   kind: DeploymentConfig
   metadata:
-    annotations:
-      openshift.io/generated-by: OpenShiftNewApp
-    creationTimestamp: 2019-04-08T13:53:17Z
-    generation: 10
+    creationTimestamp: null
+    generation: 1
+    labels:
+      app: blackbox-exporter
+    name: blackbox-exporter
+  spec:
+    replicas: 1
+    revisionHistoryLimit: 5
+    selector:
+      app: blackbox-exporter
+      deploymentconfig: blackbox-exporter
+    strategy:
+      activeDeadlineSeconds: 21600
+      resources: {}
+      rollingParams:
+        intervalSeconds: 1
+        maxSurge: 25%
+        maxUnavailable: 25%
+        timeoutSeconds: 600
+        updatePeriodSeconds: 1
+      type: Rolling
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app: blackbox-exporter
+          deploymentconfig: blackbox-exporter
+      spec:
+        containers:
+        - image: "${IMAGE_BLACKBOX_EXPORTER}"
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /
+            port: 9115
+            scheme: HTTP
+          initialDelaySeconds: 2
+          periodSeconds: 10
+          successThreshold: 1
+          timeoutSeconds: 1
+          name: blackbox-exporter
+          ports:
+          - containerPort: 9115
+            protocol: TCP
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /
+              port: 9115
+              scheme: HTTP
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 1
+          resources: {}
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        terminationGracePeriodSeconds: 30
+    test: false
+    triggers:
+    - type: ConfigChange
+
+- apiVersion: v1
+  kind: Service
+  metadata:
+    labels:
+      app: blackbox-exporter
+    name: blackbox-exporter
+  spec:
+    ports:
+    - name: 9115-tcp
+      port: 9115
+      protocol: TCP
+      targetPort: 9115
+    selector:
+      deploymentconfig: blackbox-exporter
+    sessionAffinity: None
+    type: ClusterIP
+
+
+- apiVersion: apps.openshift.io/v1
+  kind: DeploymentConfig
+  metadata:
+    generation: 5
     labels:
       app: alertmanager
     name: alertmanager
@@ -418,7 +510,7 @@ objects:
       role: service\n    namespaces:\n      names:\n      - prometheus\n\n  relabel_configs:\n
       \ - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_probe]\n
       \   action: keep\n    regex: true\n  - source_labels: [__address__]\n    target_label:
-      __param_target\n  - target_label: __address__\n    replacement: blackbox-exporter.example.com:9115\n
+      __param_target\n  - target_label: __address__\n    replacement: blackbox-exporter.${NAMESPACE}.svc:9115\n
       \ - source_labels: [__param_target]\n    target_label: instance\n  - action:
       labelmap\n    regex: __meta_kubernetes_service_label_(.+)\n  - source_labels:
       [__meta_kubernetes_namespace]\n    target_label: kubernetes_namespace\n  - source_labels:

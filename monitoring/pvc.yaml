@@ -10,7 +10,7 @@ items:
     - ReadWriteOnce
     resources:
       requests:
-        storage: 4Gi
+        storage: 5Gi
 - apiVersion: v1
   kind: PersistentVolumeClaim
   metadata:
@@ -21,7 +21,7 @@ items:
     - ReadWriteOnce
     resources:
       requests:
-        storage: 20Gi
+        storage: 50Gi
 kind: List
 metadata:
   resourceVersion: ""
