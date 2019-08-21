@@ -25,6 +25,9 @@ parameters:
 - description: The location of the blackbox exporter image
   name: IMAGE_BLACKBOX_EXPORTER
   value: quay.io/prometheus/blackbox-exporter:v0.14.0
+- description: The location of the kube state metrics  image
+  name: KUBE_STATE_METRICS
+  value: quay.io/coreos/kube-state-metrics:v1.6.0
 - description: The session secret for the proxy
   name: SESSION_SECRET
   generate: expression
@@ -39,22 +42,56 @@ objects:
     annotations:
       serviceaccounts.openshift.io/oauth-redirectreference.prom: '{"kind":"OAuthRedirectReference","apiVersion":"v1","reference":{"kind":"Route","name":"prometheus"}}'
       serviceaccounts.openshift.io/oauth-redirectreference.alerts: '{"kind":"OAuthRedirectReference","apiVersion":"v1","reference":{"kind":"Route","name":"alerts"}}'
+- apiVersion: v1
+  kind: ServiceAccount
+  metadata:
+    name: kube-state-metrics
+    namespace: "${NAMESPACE}"
+
 - apiVersion: authorization.openshift.io/v1
   kind: ClusterRoleBinding
   metadata:
     name: prometheus-cluster-reader
   roleRef:
-    name: system:auth-delegator 
+    name: system:auth-delegator
   subjects:
   - kind: ServiceAccount
     name: prometheus
     namespace: "${NAMESPACE}"
 - apiVersion: authorization.openshift.io/v1
+  groupNames: null
+  kind: ClusterRoleBinding
+  metadata:
+    name: cluster-reader-prometheus
+  roleRef:
+    name: cluster-reader
+  subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: "${NAMESPACE}"
+  userNames:
+  - "system:serviceaccount:${NAMESPACE}:prometheus"
+
+- apiVersion: authorization.openshift.io/v1
+  groupNames: null
+  kind: ClusterRoleBinding
+  metadata:
+    name: kube-state-metrics-monitoring
+  roleRef:
+    name: kube-state-metrics
+  subjects:
+  - kind: ServiceAccount
+    name: kube-state-metrics
+    namespace: "${NAMESPACE}"
+  userNames:
+  - "system:serviceaccount:${NAMESPACE}:kube-state-metrics"
+
+- apiVersion: authorization.openshift.io/v1
   kind: RoleBinding
   metadata:
     name: prometheus-viewer
   roleRef:
-    name: view 
+    name: view
   subjects:
   - kind: ServiceAccount
     name: prometheus
@@ -90,6 +127,20 @@ objects:
       port: 443
       protocol: TCP
       targetPort: 8443
+    selector:
+      app: prometheus
+- apiVersion: v1
+  kind: Service
+  metadata:
+    annotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/scheme: http
+    labels:
+      name: prometheus
+    name: prometheus-direct
+    namespace: "${NAMESPACE}"
+  spec:
+    ports:
     - name: prometheus-direct
       port: 9090
       protocol: TCP
@@ -103,6 +154,60 @@ objects:
     namespace: "${NAMESPACE}"
   stringData:
     session_secret: "${SESSION_SECRET}="
+
+
+- apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    labels:
+      app: kube-state-metrics
+    name: kube-state-metrics
+    namespace: "${NAMESPACE}"
+  spec:
+    progressDeadlineSeconds: 600
+    replicas: 1
+    revisionHistoryLimit: 10
+    selector:
+      matchLabels:
+        app: kube-state-metrics
+    strategy:
+      rollingUpdate:
+        maxSurge: 25%
+        maxUnavailable: 25%
+      type: RollingUpdate
+    template:
+      metadata:
+        annotations:
+          prometheus.io/path: /metrics
+          prometheus.io/port: '8080'
+          prometheus.io/scrape: 'true'
+        labels:
+          app: kube-state-metrics
+      spec:
+        containers:
+          - image: "${KUBE_STATE_METRICS}"
+            imagePullPolicy: IfNotPresent
+            name: kube-rbac-proxy-main
+            ports:
+              - containerPort: 8443
+                name: https-main
+                protocol: TCP
+            resources:
+              limits:
+                cpu: 200m
+                memory: 400Mi
+              requests:
+                cpu: 10m
+                memory: 20Mi
+            terminationMessagePath: /dev/termination-log
+            terminationMessagePolicy: File
+        dnsPolicy: ClusterFirst
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: kube-state-metrics
+        serviceAccountName: kube-state-metrics
+        terminationGracePeriodSeconds: 30
 
 - apiVersion: apps.openshift.io/v1
   kind: DeploymentConfig
@@ -302,7 +407,7 @@ objects:
         maxUnavailable: 25%
         timeoutSeconds: 600
         updatePeriodSeconds: 1
-      type: Rolling
+      type: Recreate
     template:
       metadata:
         creationTimestamp: null
@@ -318,11 +423,11 @@ objects:
           - -http-address=
           - -email-domain=*
           - -upstream=http://localhost:9090
-          - -client-id=system:serviceaccount:prometheus:prometheus
+          - -client-id=system:serviceaccount:${NAMESPACE}:prometheus
           - -openshift-ca=/etc/pki/tls/cert.pem
           - -openshift-ca=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
           - '-openshift-sar={"resource": "namespaces", "verb": "get", "resourceName":
-            "prometheus", "namespace": "prometheus"}'
+            "prometheus", "namespace": "${NAMESPACE}"}'
           - -tls-cert=/etc/tls/private/tls.crt
           - -tls-key=/etc/tls/private/tls.key
           - -client-secret-file=/var/run/secrets/kubernetes.io/serviceaccount/token
