@@ -15,7 +15,7 @@ parameters:
 #  value: kube-system
 - description: The location of the proxy image
   name: IMAGE_PROXY
-  value: openshift/oauth-proxy:v1.0.0
+  value: registry.redhat.io/openshift3/oauth-proxy:v3.11
 - description: The location of the prometheus image
   name: IMAGE_PROMETHEUS
   value: quay.io/prometheus/prometheus:v2.9.2
@@ -28,10 +28,18 @@ parameters:
 - description: The location of the kube state metrics  image
   name: KUBE_STATE_METRICS
   value: quay.io/coreos/kube-state-metrics:v1.6.0
-- description: The session secret for the proxy
-  name: SESSION_SECRET
+- description: The session secret for the alert manager proxy
+  name: ALERTMANAGER_SESSION_SECRET
   generate: expression
   from: "[a-zA-Z0-9]{43}"
+- description: The session secret for the prometheus proxy
+  name: PROMETHEUS_SESSION_SECRET
+  generate: expression
+  from: "[a-zA-Z0-9]{43}"
+- description: Wildcard domain (e.g. apps.example.com)
+  name: WILDCARD_DOMAIN
+  required: true
+  value: apps.example.com
 objects:
 # Authorize the prometheus service account to read data about the cluster
 - apiVersion: v1
@@ -41,7 +49,7 @@ objects:
     namespace: "${NAMESPACE}"
     annotations:
       serviceaccounts.openshift.io/oauth-redirectreference.prom: '{"kind":"OAuthRedirectReference","apiVersion":"v1","reference":{"kind":"Route","name":"prometheus"}}'
-      serviceaccounts.openshift.io/oauth-redirectreference.alerts: '{"kind":"OAuthRedirectReference","apiVersion":"v1","reference":{"kind":"Route","name":"alerts"}}'
+      serviceaccounts.openshift.io/oauth-redirectreference.alerts: '{"kind":"OAuthRedirectReference","apiVersion":"v1","reference":{"kind":"Route","name":"alertmanager"}}'
 - apiVersion: v1
   kind: ServiceAccount
   metadata:
@@ -103,6 +111,7 @@ objects:
     name: prometheus
     namespace: "${NAMESPACE}"
   spec:
+    host: "prometheus-${NAMESPACE}.${WILDCARD_DOMAIN}"
     to:
       name: prometheus
     port:
@@ -153,7 +162,7 @@ objects:
     name: prometheus-proxy
     namespace: "${NAMESPACE}"
   stringData:
-    session_secret: "${SESSION_SECRET}="
+    session_secret: "${PROMETHEUS_SESSION_SECRET}="
 
 
 - apiVersion: apps/v1
@@ -296,208 +305,305 @@ objects:
     sessionAffinity: None
     type: ClusterIP
 
-
-- apiVersion: apps.openshift.io/v1
-  kind: DeploymentConfig
+- apiVersion: v1
+  kind: Service
   metadata:
-    generation: 5
+    annotations:
+      service.alpha.openshift.io/serving-cert-secret-name: alertmanager-tls
+    labels:
+      name: alertmanager
+    name: alertmanager-tls
+    namespace: ${NAMESPACE}
+  spec:
+    ports:
+      - name: web
+        port: 443
+        protocol: TCP
+        targetPort: 8443
+    selector:
+      app: alertmanager
+    sessionAffinity: None
+    type: ClusterIP
+
+
+- apiVersion: v1
+  kind: Service
+  metadata:
+    labels:
+      app: alertmanager
+    name: alertmanager-operated
+    namespace: ${NAMESPACE}
+  spec:
+    clusterIP: None
+    ports:
+      - name: web
+        port: 9093
+        protocol: TCP
+        targetPort: 9093
+      - name: mesh
+        port: 6783
+        protocol: TCP
+        targetPort: 6783
+    selector:
+      app: alertmanager
+    sessionAffinity: None
+    type: ClusterIP
+
+- apiVersion: apps/v1
+  kind: StatefulSet
+  metadata:
+    generation: 3
     labels:
       app: alertmanager
     name: alertmanager
     namespace: "${NAMESPACE}"
   spec:
-    replicas: 1
+    podManagementPolicy: OrderedReady
+    replicas: 2
     revisionHistoryLimit: 10
     selector:
-      app: alertmanager
-      deploymentconfig: alertmanager
-    strategy:
-      activeDeadlineSeconds: 21600
-      recreateParams:
-        timeoutSeconds: 600
-      resources: {}
-      rollingParams:
-        intervalSeconds: 1
-        maxSurge: 25%
-        maxUnavailable: 25%
-        timeoutSeconds: 600
-        updatePeriodSeconds: 1
-      type: Rolling
+      matchLabels:
+        app: alertmanager
+    serviceName: alertmanager-operated
     template:
       metadata:
         creationTimestamp: null
         labels:
           app: alertmanager
-          deploymentconfig: alertmanager
-        name: alertmanager
       spec:
         containers:
-        - args:
-          - --config.file=/etc/alertmanager/config.yml
-          - --storage.path=/alertmanager
-          image: ${IMAGE_ALERTMANAGER}
-          imagePullPolicy: IfNotPresent
-          livenessProbe:
-            failureThreshold: 3
-            httpGet:
-              path: /#/status
-              port: 9093
-              scheme: HTTP
-            initialDelaySeconds: 2
-            periodSeconds: 10
-            successThreshold: 1
-            timeoutSeconds: 1
-          name: alertmanager
-          readinessProbe:
-            failureThreshold: 3
-            httpGet:
-              path: /#/status
-              port: 9093
-              scheme: HTTP
-            initialDelaySeconds: 2
-            periodSeconds: 10
-            successThreshold: 1
-            timeoutSeconds: 1
-          resources: {}
-          terminationMessagePath: /dev/termination-log
-          terminationMessagePolicy: File
-          volumeMounts:
-          - mountPath: /etc/alertmanager
-            name: config-volume
-          - mountPath: /alertmanager
-            name: data-volume
-        dnsPolicy: ClusterFirst
-        restartPolicy: Always
-        schedulerName: default-scheduler
-        securityContext: {}
-        terminationGracePeriodSeconds: 30
-        volumes:
-        - name: data-volume
-          persistentVolumeClaim:
-            claimName: alertmanager-data-pvc
-        - configMap:
-            defaultMode: 420
+          - args:
+              - '--config.file=/etc/alertmanager/config.yml'
+              - '--cluster.listen-address=$(POD_IP):6783'
+              - >-
+                --cluster.peer=alertmanager-0.alertmanager-operated.${NAMESPACE}.svc.cluster.local:6783
+              - >-
+                --cluster.peer=alertmanager-1.alertmanager-operated.${NAMESPACE}.svc.cluster.local:6783
+              - '--storage.path=/alertmanager'
+              - '--data.retention=120h'
+              - >-
+                --web.external-url=https://alertmanager-${NAMESPACE}.${WILDCARD_DOMAIN}
+            env:
+              - name: POD_IP
+                valueFrom:
+                  fieldRef:
+                    apiVersion: v1
+                    fieldPath: status.podIP
+            image: ${IMAGE_ALERTMANAGER}
+            imagePullPolicy: IfNotPresent
             name: alertmanager
-          name: config-volume
-    test: false
-    triggers:
-    - type: ConfigChange
-- apiVersion: apps.openshift.io/v1
-  kind: DeploymentConfig
-  metadata:
-    generation: 7
-    labels:
-      app: prometheus
-    name: prometheus
-    namespace: "${NAMESPACE}"
-  spec:
-    replicas: 1
-    revisionHistoryLimit: 10
-    selector:
-      app: prometheus
-      deploymentconfig: prometheus
-    strategy:
-      activeDeadlineSeconds: 21600
-      recreateParams:
-        timeoutSeconds: 600
-      resources: {}
-      rollingParams:
-        intervalSeconds: 1
-        maxSurge: 25%
-        maxUnavailable: 25%
-        timeoutSeconds: 600
-        updatePeriodSeconds: 1
-      type: Recreate
-    template:
-      metadata:
-        creationTimestamp: null
-        labels:
-          app: prometheus
-          deploymentconfig: prometheus
-        name: prometheus
-      spec:
-        containers:
-        - args:
-          - -provider=openshift
-          - -https-address=:8443
-          - -http-address=
-          - -email-domain=*
-          - -upstream=http://localhost:9090
-          - -client-id=system:serviceaccount:${NAMESPACE}:prometheus
-          - -openshift-ca=/etc/pki/tls/cert.pem
-          - -openshift-ca=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-          - '-openshift-sar={"resource": "namespaces", "verb": "get", "resourceName":
-            "prometheus", "namespace": "${NAMESPACE}"}'
-          - -tls-cert=/etc/tls/private/tls.crt
-          - -tls-key=/etc/tls/private/tls.key
-          - -client-secret-file=/var/run/secrets/kubernetes.io/serviceaccount/token
-          - -cookie-secret-file=/etc/proxy/secrets/session_secret
-          - -skip-auth-regex=^/metrics
-          image: openshift/oauth-proxy:v1.0.0
-          imagePullPolicy: IfNotPresent
-          name: prom-proxy
-          ports:
-          - containerPort: 8443
-            name: web
-            protocol: TCP
-          resources:
-            limits:
-              cpu: 100m
-              memory: 200Mi
-          terminationMessagePath: /dev/termination-log
-          terminationMessagePolicy: File
-          volumeMounts:
-          - mountPath: /etc/tls/private
-            name: prometheus-tls
-          - mountPath: /etc/proxy/secrets
-            name: prometheus-secrets
-        - args:
-          - --storage.tsdb.retention=6h
-          - --storage.tsdb.min-block-duration=2m
-          - --config.file=/etc/prometheus/prometheus.yml
-          - --web.enable-lifecycle
-          image: ${IMAGE_PROMETHEUS}
-          imagePullPolicy: IfNotPresent
-          name: prometheus
-          ports:
-          - containerPort: 9090
-            name: prometheus
-            protocol: TCP
-          resources:
-            limits:
-              cpu: 400m
-              memory: 1Gi
-          terminationMessagePath: /dev/termination-log
-          terminationMessagePolicy: File
-          volumeMounts:
-          - mountPath: /etc/prometheus
-            name: prometheus-config
-          - mountPath: /prometheus
-            name: prometheus-data
+            ports:
+              - containerPort: 6783
+                name: mesh
+                protocol: TCP
+            resources:
+              requests:
+                memory: 200Mi
+            terminationMessagePath: /dev/termination-log
+            terminationMessagePolicy: File
+            volumeMounts:
+              - mountPath: /etc/alertmanager
+                name: config-volume
+              - mountPath: /alertmanager
+                name: data
+          - args:
+              - '-provider=openshift'
+              - '-https-address=:8443'
+              - '-http-address='
+              - '-email-domain=*'
+              - '-upstream=http://localhost:9093'
+              - '-client-id=system:serviceaccount:${NAMESPACE}:prometheus'
+              - '-openshift-ca=/etc/pki/tls/cert.pem'
+              - '-openshift-ca=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'
+              - >-
+                -openshift-sar={"resource": "namespaces", "verb": "get",
+                "resourceName": "pods", "namespace": "${NAMESPACE}"}
+              - '-tls-cert=/etc/tls/private/tls.crt'
+              - '-tls-key=/etc/tls/private/tls.key'
+              - >-
+                -client-secret-file=/var/run/secrets/kubernetes.io/serviceaccount/token
+              - '-cookie-secret-file=/etc/proxy/secrets/session_secret'
+              - '-skip-auth-regex=^/metrics'
+            image: ${IMAGE_PROXY}
+            imagePullPolicy: IfNotPresent
+            name: alertmanager-proxy
+            ports:
+              - containerPort: 8443
+                name: web
+                protocol: TCP
+            resources:
+              limits:
+                cpu: 100m
+                memory: 200Mi
+            terminationMessagePath: /dev/termination-log
+            terminationMessagePolicy: File
+            volumeMounts:
+              - mountPath: /etc/tls/private
+                name: alertmanager-tls
+              - mountPath: /etc/proxy/secrets
+                name: alertmanager-secrets
         dnsPolicy: ClusterFirst
+        nodeSelector:
+          node-role.kubernetes.io/compute: 'true'
         restartPolicy: Always
         schedulerName: default-scheduler
         securityContext: {}
         serviceAccount: prometheus
         serviceAccountName: prometheus
-        terminationGracePeriodSeconds: 30
+        terminationGracePeriodSeconds: 0
         volumes:
-        - name: prometheus-secrets
-          secret:
-            secretName: prometheus-proxy
-        - name: prometheus-tls
-          secret:
-            secretName: prometheus-tls
-        - configMap:
-            defaultMode: 420
+          - configMap:
+              defaultMode: 420
+              name: alertmanager
+            name: config-volume
+          - name: alertmanager-tls
+            secret:
+              defaultMode: 420
+              secretName: alertmanager-tls
+          - name: alertmanager-secrets
+            secret:
+              defaultMode: 420
+              secretName: alertmanager-proxy
+    updateStrategy:
+      type: RollingUpdate
+    volumeClaimTemplates:
+      - metadata:
+          creationTimestamp: null
+          labels:
+            app: alertmanager
+          name: data
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 2Gi
+        status:
+          phase: Pending
+
+- apiVersion: apps/v1
+  kind: StatefulSet
+  metadata:
+    labels:
+      app: prometheus
+    name: prometheus
+    namespace: ${NAMESPACE}
+  spec:
+    podManagementPolicy: OrderedReady
+    replicas: 2
+    revisionHistoryLimit: 10
+    selector:
+      matchLabels:
+        app: prometheus
+    serviceName: prometheus
+    template:
+      metadata:
+        creationTimestamp: null
+        labels:
+          app: prometheus
+      spec:
+        containers:
+          - args:
+              - '--storage.tsdb.retention=6h'
+              - '--storage.tsdb.min-block-duration=2m'
+              - '--config.file=/etc/prometheus/prometheus.yml'
+              - '--web.enable-lifecycle'
+              - >-
+                --web.external-url=https://prometheus-${NAMESPACE}.${WILDCARD_DOMAIN}
+              - '--storage.tsdb.no-lockfile'
+              - '--web.route-prefix=/'
+            image: '${IMAGE_PROMETHEUS}'
+            imagePullPolicy: IfNotPresent
             name: prometheus
-          name: prometheus-config
-        - name: prometheus-data
-          persistentVolumeClaim:
-            claimName: prometheus-data-pvc
-    test: false
-    triggers:
-    - type: ConfigChange
+            ports:
+              - containerPort: 9090
+                name: prometheus
+                protocol: TCP
+            resources:
+              limits:
+                cpu: 400m
+                memory: 1Gi
+            terminationMessagePath: /dev/termination-log
+            terminationMessagePolicy: File
+            volumeMounts:
+              - mountPath: /etc/prometheus
+                name: prometheus-config
+              - mountPath: /prometheus
+                name: data
+          - args:
+              - '-provider=openshift'
+              - '-https-address=:8443'
+              - '-http-address='
+              - '-email-domain=*'
+              - '-upstream=http://localhost:9090'
+              - '-client-id=system:serviceaccount:${NAMESPACE}:prometheus'
+              - '-openshift-ca=/etc/pki/tls/cert.pem'
+              - '-openshift-ca=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'
+              - >-
+                -openshift-sar={"resource": "namespaces", "verb": "get",
+                "resourceName": "pods", "namespace": "${NAMESPACE}"}
+              - '-tls-cert=/etc/tls/private/tls.crt'
+              - '-tls-key=/etc/tls/private/tls.key'
+              - >-
+                -client-secret-file=/var/run/secrets/kubernetes.io/serviceaccount/token
+              - '-cookie-secret-file=/etc/proxy/secrets/session_secret'
+              - '-skip-auth-regex=^/metrics'
+            image: '${IMAGE_PROXY}'
+            imagePullPolicy: IfNotPresent
+            name: prometheus-proxy
+            ports:
+              - containerPort: 8443
+                name: web
+                protocol: TCP
+            resources:
+              limits:
+                cpu: 100m
+                memory: 200Mi
+            terminationMessagePath: /dev/termination-log
+            terminationMessagePolicy: File
+            volumeMounts:
+              - mountPath: /etc/tls/private
+                name: prometheus-tls
+              - mountPath: /etc/proxy/secrets
+                name: prometheus-secrets
+        dnsPolicy: ClusterFirst
+        nodeSelector:
+          node-role.kubernetes.io/compute: 'true'
+        restartPolicy: Always
+        schedulerName: default-scheduler
+        securityContext: {}
+        serviceAccount: prometheus
+        serviceAccountName: prometheus
+        terminationGracePeriodSeconds: 600
+        volumes:
+          - name: prometheus-secrets
+            secret:
+              defaultMode: 420
+              secretName: prometheus-proxy
+          - name: prometheus-tls
+            secret:
+              defaultMode: 420
+              secretName: prometheus-tls
+          - configMap:
+              defaultMode: 420
+              name: prometheus
+            name: prometheus-config
+    updateStrategy:
+      type: RollingUpdate
+    volumeClaimTemplates:
+      - metadata:
+          creationTimestamp: null
+          labels:
+            app: prometheus
+          name: data
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 50Gi
+        status:
+          phase: Pending
 
 - apiVersion: v1
   data:
@@ -570,7 +676,7 @@ objects:
       service using the\n# default named port `https`. This works for single API server
       deployments as\n# well as HA API server deployments.\nscrape_configs:\n- job_name:
       'kubernetes-pods'\n\n  kubernetes_sd_configs:\n  - role: pod\n    namespaces:\n
-      \     names:\n      - prometheus\n      - java-test\n\n  relabel_configs:\n
+      \     names:\n      - ${NAMESPACE}\n      - java-test\n\n  relabel_configs:\n
       \ - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]\n
       \   action: keep\n    regex: true\n  - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]\n
       \   action: replace\n    target_label: __metrics_path__\n    regex: (.+)\n  -
@@ -590,7 +696,7 @@ objects:
       appropriately.\n- job_name: 'kubernetes-service-endpoints'\n\n  tls_config:\n
       \   ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt\n    # TODO:
       this should be per target\n    insecure_skip_verify: true\n\n  kubernetes_sd_configs:\n
-      \ - role: endpoints\n    namespaces:\n      names:\n      - prometheus\n\n  relabel_configs:\n
+      \ - role: endpoints\n    namespaces:\n      names:\n      - ${NAMESPACE}\n\n  relabel_configs:\n
       \ - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]\n
       \   action: keep\n    regex: true\n  - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scheme]\n
       \   action: replace\n    target_label: __scheme__\n    regex: (https?)\n  -
@@ -612,7 +718,7 @@ objects:
       \ tls_config:\n    ca_file: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt\n
       \   # TODO: this should be per target\n    insecure_skip_verify: true\n\n  metrics_path:
       /metrics\n  params:\n    module: [http_2xx]\n\n  kubernetes_sd_configs:\n  -
-      role: service\n    namespaces:\n      names:\n      - prometheus\n\n  relabel_configs:\n
+      role: service\n    namespaces:\n      names:\n      - ${NAMESPACE}\n\n  relabel_configs:\n
       \ - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_probe]\n
       \   action: keep\n    regex: true\n  - source_labels: [__address__]\n    target_label:
       __param_target\n  - target_label: __address__\n    replacement: blackbox-exporter.${NAMESPACE}.svc:9115\n
@@ -621,23 +727,27 @@ objects:
       [__meta_kubernetes_namespace]\n    target_label: kubernetes_namespace\n  - source_labels:
       [__meta_kubernetes_service_name]\n    target_label: kubernetes_name\n    \nalerting:\n
       \ alertmanagers:\n  - scheme: http\n    static_configs:\n    - targets:\n      -
-      \"alertmanager.prometheus.svc:9093\"\n"
+      \"alertmanager.${NAMESPACE}.svc:9093\"\n"
   kind: ConfigMap
   metadata:
     name: prometheus
     namespace: ${NAMESPACE}
 
-# Create a fully end-to-end TLS connection to the alert proxy
+# Create a fully end-to-end TLS connection to the alertmanager proxy
 - apiVersion: route.openshift.io/v1
   kind: Route
   metadata:
     name: alertmanager
     namespace: "${NAMESPACE}"
   spec:
+    host: "alertmanager-${NAMESPACE}.${WILDCARD_DOMAIN}"
     to:
-      name: alertmanager
+      name: alertmanager-tls
+    port:
+      targetPort: web
     tls:
-      termination: Edge
+      termination: Reencrypt
+      insecureEdgeTerminationPolicy: Redirect
 
 - apiVersion: v1
   kind: Service
@@ -657,7 +767,7 @@ objects:
 - apiVersion: v1
   kind: Secret
   metadata:
-    name: alerts-proxy
+    name: alertmanager-proxy
     namespace: "${NAMESPACE}"
   stringData:
-    session_secret: "${SESSION_SECRET}="
+    session_secret: "${ALERTMANAGER_SESSION_SECRET}="
